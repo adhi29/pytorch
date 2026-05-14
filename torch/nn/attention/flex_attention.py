@@ -2366,28 +2366,59 @@ def flex_attention(
         # This corresponds to the case where we essentially have a "no-op" block mask.
         pass
     else:
+        from torch.fx.experimental.symbolic_shapes import guard_or_false
+
+        q_len = query.size(-2)
+        kv_len = key.size(-2)
         block_mask_q_len = block_mask.shape[-2]
         block_mask_kv_len = block_mask.shape[-1]
-        if query.size(-2) > block_mask_q_len or key.size(-2) > block_mask_kv_len:
-            raise ValueError(
-                f"block_mask was created for block_mask.shape={block_mask.shape} but got q_len={query.size(-2)} and kv_len={key.size(-2)}. "
-                "As the block mask was created for a smaller length than you're using it for, you likely need to create a new block mask."
-            )
-        elif (
-            query.size(-2) < block_mask_q_len and key.size(-2) <= block_mask_kv_len
-        ) or (query.size(-2) <= block_mask_q_len and key.size(-2) < block_mask_kv_len):
-            raise ValueError(
-                f"block_mask was created for block_mask.shape={block_mask.shape} but got q_len={query.size(-2)} and kv_len={key.size(-2)}. "
-                "As the block mask was created for a larger length than you're using it for, you can either 1. create a new block mask with the correct length, or 2. 'adjust' the existing block mask to the correct length by calling block_mask._adjust(q_len, kv_len). This essentially 'crops' the block mask to the upper left corner, which does not work for all mask_mods!"
-            )
-        if query.size(-2) != block_mask_q_len:
-            raise AssertionError(
-                f"query.size(-2) ({query.size(-2)}) != block_mask_q_len ({block_mask_q_len})"
-            )
-        if key.size(-2) != block_mask_kv_len:
-            raise AssertionError(
-                f"key.size(-2) ({key.size(-2)}) != block_mask_kv_len ({block_mask_kv_len})"
-            )
+        smaller_mask_msg = (
+            "block_mask was created for "
+            f"block_mask.shape={block_mask.shape} but got "
+            f"q_len={q_len} and kv_len={kv_len}. "
+            "As the block mask was created for a smaller length than you're "
+            "using it for, you likely need to create a new block mask."
+        )
+        larger_mask_msg = (
+            "block_mask was created for "
+            f"block_mask.shape={block_mask.shape} but got "
+            f"q_len={q_len} and kv_len={kv_len}. "
+            "As the block mask was created for a larger length than you're "
+            "using it for, you can either 1. create a new block mask with the "
+            "correct length, or 2. 'adjust' the existing block mask to the "
+            "correct length by calling block_mask._adjust(q_len, kv_len). "
+            "This essentially 'crops' the block mask to the upper left corner, "
+            "which does not work for all mask_mods!"
+        )
+        if guard_or_false(q_len > block_mask_q_len) or guard_or_false(
+            kv_len > block_mask_kv_len
+        ):
+            raise ValueError(smaller_mask_msg)
+        if guard_or_false(q_len < block_mask_q_len) or guard_or_false(
+            kv_len < block_mask_kv_len
+        ):
+            raise ValueError(larger_mask_msg)
+        torch._check_value(
+            q_len <= block_mask_q_len,
+            lambda: "block_mask q_len exceeds the query length it was created for",
+        )
+        torch._check_value(
+            kv_len <= block_mask_kv_len,
+            lambda: "block_mask kv_len exceeds the key/value length it was created for",
+        )
+        torch._check_value(
+            q_len >= block_mask_q_len,
+            lambda: (
+                "block_mask q_len is smaller than the query length it was created for"
+            ),
+        )
+        torch._check_value(
+            kv_len >= block_mask_kv_len,
+            lambda: (
+                "block_mask kv_len is smaller than the key/value length it was "
+                "created for"
+            ),
+        )
 
     if scale is None:
         scale = 1.0 / math.sqrt(query.size(-1))
