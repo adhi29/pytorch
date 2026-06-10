@@ -43,10 +43,19 @@ def load_checked_2d(
     IS_DIVISIBLE_N: tl.constexpr,
     M_LEN: tl.constexpr,
     N_LEN: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr = tl.int32,
 ):
-    # Calculate final pointer if strides are provided
+    # Calculate final pointer if strides are provided. The caller controls
+    # the index dtype via INDEX_DTYPE; Inductor picks int64 whenever the
+    # source tensor's byte size could exceed the AMD buffer-resource
+    # NUM_RECORDS cap (~2 GiB), which would otherwise truncate the load
+    # offset to a 32-bit value and silently fault.
     if stride_m is not None and stride_n is not None:
-        ptr = ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+        ptr = (
+            ptr
+            + offs_m[:, None].to(INDEX_DTYPE) * stride_m
+            + offs_n[None, :].to(INDEX_DTYPE) * stride_n
+        )
 
     # Handle all masking cases
     if not IS_DIVISIBLE_M and not IS_DIVISIBLE_N:

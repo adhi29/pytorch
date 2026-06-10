@@ -2684,8 +2684,13 @@ class TritonTemplate(KernelTemplate):
         else:
             index_dtype = "tl.int64"
 
-        # Add index dtype to defines so it's available in the template
-        defines.write(f"INDEX_DTYPE : tl.constexpr = {index_dtype}\n")
+        # Add index dtype to defines so it's available in the template.
+        # Only emit it if the caller did not already pass an override via
+        # kwargs (e.g. flex_attention forces int64 when any input's byte
+        # size could exceed the AMD buffer-resource NUM_RECORDS cap, which
+        # the element-count-based heuristic above does not catch).
+        if "INDEX_DTYPE" not in kwargs:
+            defines.write(f"INDEX_DTYPE : tl.constexpr = {index_dtype}\n")
         defines = defines.getvalue()
 
         kernel_options = {

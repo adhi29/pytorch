@@ -107,6 +107,43 @@ flex_attention_template = TritonTemplate(
 )
 
 
+# AMD's Triton backend lowers `tl.load` on global pointers into a
+# buffer-resource load whose descriptor `NUM_RECORDS` is bounded by INT32_MAX
+# (~2 GiB in bytes). Inductor's default `INDEX_DTYPE` heuristic uses the
+# tensor's element count vs INT32_MAX, which misses tensors whose byte size
+# exceeds 2 GiB while their element count still fits in 32 bits (e.g. a bf16
+# paged KV cache with ~1.6 G elements = 3.2 GiB). For such tensors the load
+# offset can overrun the buffer-resource cap and silently fault.
+#
+# This helper returns "tl.int64" whenever any of the supplied buffers'
+# byte sizes cannot be statically proven to fit in 2 GiB, regardless of
+# element count. The caller threads the result into `cur_kernel_options`
+# as `INDEX_DTYPE`, overriding the element-count-based default set by
+# `TritonTemplate.maybe_append_choice`.
+def _flex_index_dtype_for_buffers(*buffers) -> str:
+    # AMD encodes `NUM_RECORDS` as an unsigned 32-bit value capped at
+    # `0x7FFFFFFE = 2147483646` in the Triton-emitted buffer descriptor.
+    # The largest in-bounds byte offset is `NUM_RECORDS - 1 = 2147483645`,
+    # so we need int64 once `byte_size > NUM_RECORDS`, i.e. `byte_size >=
+    # 2147483647`. Using `<= AMD_NUM_RECORDS_CAP` keeps the boundary cases
+    # `byte_size == 2147483647` and `byte_size == 2147483648` from
+    # silently picking int32 and faulting at runtime.
+    amd_num_records_cap = sympy.Integer(2147483646)
+    for buf in buffers:
+        if buf is None:
+            continue
+        layout = buf.get_layout()
+        try:
+            storage_elems = layout.storage_size()
+            dtype_size = layout.dtype.itemsize
+        except (AttributeError, NotImplementedError):
+            return "tl.int64"
+        byte_size = storage_elems * dtype_size
+        if not V.graph.sizevars.statically_known_true(byte_size <= amd_num_records_cap):
+            return "tl.int64"
+    return "tl.int32"
+
+
 @register_lowering(torch.ops.higher_order.flex_attention, type_promotion_kind=None)
 def flex_attention(
     query,
@@ -464,6 +501,13 @@ def flex_attention(
         for attrib in ["kpack", "matrix_instr_nonkdim", "waves_per_eu"]:
             if hasattr(conf, attrib):
                 cur_kernel_options[attrib] = getattr(conf, attrib)
+
+        # Override Inductor's element-count-based INDEX_DTYPE with a
+        # byte-size-aware version so the AMD buffer-resource ~2 GiB cap is
+        # respected (see _flex_index_dtype_for_buffers above).
+        cur_kernel_options["INDEX_DTYPE"] = _flex_index_dtype_for_buffers(
+            query, key, value
+        )
 
         error = flex_attention_template.maybe_append_choice(
             choices=choices,
@@ -989,6 +1033,11 @@ def flex_attention_backward(*args, **kwargs):
         for attrib in ["kpack", "matrix_instr_nonkdim", "waves_per_eu"]:
             if hasattr(conf, attrib):
                 cur_kernel_options[attrib] = getattr(conf, attrib)
+
+        # Byte-size-aware INDEX_DTYPE — see _flex_index_dtype_for_buffers.
+        cur_kernel_options["INDEX_DTYPE"] = _flex_index_dtype_for_buffers(
+            query, key, value, grad_out
+        )
 
         flex_attention_backward_template.maybe_append_choice(
             choices=choices,

@@ -1722,6 +1722,225 @@ class TestFlexAttention(InductorTestCase):
 
     @supported_platform
     @skip_on_cpu
+    @skip_on_mps  # CPU/MPS use a different template
+    def test_paged_kv_load_past_2gb_offset(self, device):
+        # Regression test for compiled FlexAttention with a paged KV cache
+        # whose K/V load element offset exceeds INT32_MAX. On AMD GPUs the
+        # `tl.load` in `load_checked_2d` is lowered to a buffer-resource
+        # read; without an explicit cast to int64, the `offs * stride`
+        # product is computed in 32-bit and wraps, dereferencing wrong
+        # memory and either trapping or returning garbage. NVIDIA's PTX
+        # has no buffer-resource concept and is unaffected.
+        #
+        # The fix is `_flex_index_dtype_for_buffers` (in
+        # `caffe2/torch/_inductor/kernel/flex/flex_attention.py`) plus the
+        # `.to(INDEX_DTYPE)` cast plumbed through `load_checked_2d`. The
+        # shape below was the original failing repro from production.
+        if device == "cuda" and not PLATFORM_SUPPORTS_BF16:
+            self.skipTest("bf16 is required for this regression test")
+
+        num_kv_heads = 8
+        head_dim = 128
+        block_size = 16
+        # Smallest num_blocks where the K-load `offs_seq * stride_seq`
+        # product exceeds INT32_MAX in elements (not just bytes):
+        # max_offs_seq = (num_blocks - 1) * block_size + (BLOCK_N - 1)
+        # stride_seq   = num_kv_heads * head_dim = 1024
+        # product      = 131072 * 16 * 1024 = 2,147,483,648 = 2**31
+        # Without the int64 cast the int32 multiply wraps here and the
+        # load reads from a wrong (possibly unmapped) virtual address.
+        num_blocks = 131073
+        kv_seq_len = num_blocks * block_size  # 2,097,168
+
+        if device == "cuda":
+            kv_bytes = 2 * num_kv_heads * kv_seq_len * head_dim * 2  # K + V, bf16
+            # Backward needs dK + dV in bf16 plus fp32 accumulators inside
+            # the autotuner, so reserve ~3x kv_bytes total on top of the
+            # forward K + V allocation.
+            free_bytes, _ = torch.cuda.mem_get_info()
+            if free_bytes < 4 * kv_bytes + (2 << 30):
+                self.skipTest(
+                    f"need ~{((4 * kv_bytes) >> 30) + 2} GiB free GPU memory "
+                    "for K+V plus their gradient buffers"
+                )
+
+        dtype = torch.bfloat16
+        # Allocate the natural paged layout, then reshape to the
+        # `(B=1, H_kv, S, D)` view vLLM produces. The permute makes the
+        # sequence-dim stride = num_kv_heads * head_dim (= 1024 elements
+        # here), so the high page lands at a byte offset that crosses the
+        # 2 GiB buffer-resource cap.
+        k_cache = (
+            torch.empty(
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            .uniform_(-0.02, 0.02)
+            .requires_grad_(True)
+        )
+        v_cache = (
+            torch.empty(
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            .uniform_(-0.02, 0.02)
+            .requires_grad_(True)
+        )
+        k = (
+            k_cache.view(kv_seq_len, num_kv_heads, head_dim)
+            .unsqueeze(0)
+            .permute(0, 2, 1, 3)
+        )
+        v = (
+            v_cache.view(kv_seq_len, num_kv_heads, head_dim)
+            .unsqueeze(0)
+            .permute(0, 2, 1, 3)
+        )
+        # Sanity: the per-token sequence stride times the highest
+        # in-bounds offset must overflow int32 (in elements) so the bug
+        # actually fires without the cast.
+        max_offs_seq = (num_blocks - 1) * block_size + block_size - 1
+        stride_seq = num_kv_heads * head_dim
+        self.assertGreater(max_offs_seq * stride_seq, (1 << 31) - 1)
+
+        num_q_heads = num_kv_heads
+        q_len = 16  # one BLOCK_M tile, keeps the test simple
+        q = (
+            torch.empty(
+                1,
+                num_q_heads,
+                q_len,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            .uniform_(-0.02, 0.02)
+            .requires_grad_(True)
+        )
+
+        # BlockMask whose single kv block references the highest physical
+        # page (`num_blocks - 1`) — the page whose byte offset crosses
+        # the 2 GiB buffer-resource cap on AMD.
+        last_page = num_blocks - 1
+        kv_indices = torch.tensor(
+            [[[[last_page]]]],
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_num_blocks = torch.ones((1, 1, 1), dtype=torch.int32, device=device)
+        block_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks=kv_num_blocks,
+            kv_indices=kv_indices,
+            BLOCK_SIZE=(q_len, block_size),
+            seq_lengths=(q_len, kv_seq_len),
+            compute_q_blocks=False,
+        )
+
+        # `dynamic=True` matches the production usage (vLLM's
+        # `flex_attention_compiled = torch.compile(..., dynamic=True)`).
+        # It also keeps strides symbolic so Inductor's element-count
+        # `can_use_32bit_indexing` cannot statically prove the buffer
+        # fits int32 and picks `tl.int64`. The `.to(INDEX_DTYPE)` cast
+        # plumbed through `load_checked_2d` is what then promotes the
+        # offsets and keeps the load address correct. Without that cast
+        # the int32 multiply inside `load_checked_2d` wraps and the
+        # buffer-resource read dereferences wrong memory.
+        compiled = torch.compile(flex_attention, fullgraph=True, dynamic=True)
+        # Kernel options match the configuration the bug was discovered
+        # under: tile sizes equal to the mask block size, non-divisible
+        # Q/KV, and the explicit flex backend (not flash).
+        out = compiled(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            enable_gqa=False,
+            kernel_options={
+                "FORCE_USE_FLEX_ATTENTION": True,
+                "BLOCK_M": 16,
+                "BLOCK_N": 16,
+                "IS_DIVISIBLE": False,
+            },
+        )
+
+        self.assertEqual(out.shape, (1, num_q_heads, q_len, head_dim))
+        # Numerical reference: only the high physical page is attended to
+        # (kv_indices = [[last_page]]), so the correct output equals
+        # SDPA(q, K[last_page_block], V[last_page_block]) with no mask.
+        # Comparing against this reference catches both failure modes of
+        # the underlying bug — hard trap and silent wrong-page garbage
+        # read — even when the garbage happens to be finite.
+        page_start = last_page * block_size
+        page_end = page_start + block_size
+        k_ref_block = k.detach()[:, :, page_start:page_end, :].to(torch.float32)
+        v_ref_block = v.detach()[:, :, page_start:page_end, :].to(torch.float32)
+        q_ref = q.detach().to(torch.float32)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref_block, v_ref_block, is_causal=False
+        ).to(out.dtype)
+        torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+        # Backward path: exercises the precomputed kT_ptrs / vT_ptrs /
+        # qT_ptrs / do_ptrs offset multiplies in flex_backwards.py.jinja.
+        # Those callsites pass stride_m=None, stride_n=None to
+        # load_checked_2d so its .to(INDEX_DTYPE) branch is bypassed.
+        # Without the matching .to(INDEX_DTYPE) casts inserted directly in
+        # the precomputed *_ptrs expressions, the int32 multiply wraps on
+        # AMD and the bwd kernel either traps or returns garbage
+        # gradients.
+        out.sum().backward()
+        # The high physical page is the only one with a non-zero gradient
+        # because it is the only one attended to. The other pages must
+        # see exactly zero, and the attended slice must match an SDPA
+        # autograd reference.
+        self.assertTrue(torch.isfinite(q.grad).all())
+        self.assertTrue(torch.isfinite(k_cache.grad).all())
+        self.assertTrue(torch.isfinite(v_cache.grad).all())
+        k_grad = k_cache.grad.view(kv_seq_len, num_kv_heads, head_dim)
+        v_grad = v_cache.grad.view(kv_seq_len, num_kv_heads, head_dim)
+        if page_start > 0:
+            self.assertEqual(k_grad[:page_start].abs().sum().item(), 0.0)
+            self.assertEqual(v_grad[:page_start].abs().sum().item(), 0.0)
+
+        q_ref = q.detach().to(torch.float32).requires_grad_(True)
+        k_ref_block = (
+            k.detach()[:, :, page_start:page_end, :]
+            .to(torch.float32)
+            .requires_grad_(True)
+        )
+        v_ref_block = (
+            v.detach()[:, :, page_start:page_end, :]
+            .to(torch.float32)
+            .requires_grad_(True)
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref_block, v_ref_block, is_causal=False
+        )
+        ref.sum().backward()
+        torch.testing.assert_close(q.grad, q_ref.grad.to(q.dtype), atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(
+            k_grad[page_start:page_end].permute(1, 0, 2).unsqueeze(0),
+            k_ref_block.grad.to(q.dtype),
+            atol=5e-3,
+            rtol=5e-3,
+        )
+        torch.testing.assert_close(
+            v_grad[page_start:page_end].permute(1, 0, 2).unsqueeze(0),
+            v_ref_block.grad.to(q.dtype),
+            atol=5e-3,
+            rtol=5e-3,
+        )
+
+    @supported_platform
+    @skip_on_cpu
     @skip_on_mps  # hardcodes kernel_options={"BACKEND": "TRITON"}
     def test_kv_order_invariance_padded_causal(self, device):
         if device == "cuda" and not PLATFORM_SUPPORTS_BF16:
@@ -5336,7 +5555,7 @@ class GraphModule(torch.nn.Module):
         def forward(self, arg0_1: "i32[]", arg1_1: "i32[]", arg2_1: "i32[]", arg3_1: "i32[]"):
             full_default: "b8[]" = torch.ops.aten.full.default([], True, dtype = torch.bool, layout = torch.strided, device = device(type='GPU_TYPE', index=0), pin_memory = False)
             return full_default
-""".replace("GPU_TYPE", torch.device(device).type),
+""".replace("GPU_TYPE", torch.device(device).type),  # fmt: skip
         )
 
     @supported_platform
