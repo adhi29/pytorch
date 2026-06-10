@@ -513,7 +513,9 @@ class NVUniversalGemmScheduling(BaseScheduling):
         if only_gen_src_code:
             return src_code
 
-        precompile_metadata = self._build_precompile_metadata(kernel, ctb)
+        precompile_metadata = self._build_precompile_metadata(
+            kernel, ctb, epilogue_nodes, epilogue_reads
+        )
 
         with V.set_kernel_handler(kernel):
             node_schedule: list[BaseSchedulerNode] = [template_node]
@@ -530,7 +532,9 @@ class NVUniversalGemmScheduling(BaseScheduling):
         self.free_buffers_in_scheduler()
         return None
 
-    def _build_precompile_metadata(self, kernel, ctb):
+    def _build_precompile_metadata(
+        self, kernel, ctb, epilogue_nodes=None, epilogue_reads=None
+    ):
         """Extract shapes and dtypes from kernel inputs/output for subprocess precompilation.
 
         Returns None if shapes are symbolic (dynamic shapes), in which case the
@@ -592,22 +596,15 @@ class NVUniversalGemmScheduling(BaseScheduling):
         max_active_clusters = None
         kernel_name = ctb.kernel_metadata.get("kernel_name")
         if kernel_name and torch.cuda.is_available():
-            try:
-                from torch._inductor.codegen.nv_universal_gemm.kernel_cache import (
-                    get_kernel_by_name,
-                )
+            from torch._inductor.codegen.nv_universal_gemm.kernel_cache import (
+                get_kernel_by_name,
+            )
 
-                k = get_kernel_by_name(kernel_name)
-                if k is not None and hasattr(k, "impl"):
-                    from cutlass_api.providers.cutedsl.utils import (
-                        get_max_active_clusters,
-                    )
+            k = get_kernel_by_name(kernel_name)
+            if k is not None and hasattr(k, "impl"):
+                from cutlass_api.providers.cutedsl.utils import get_max_active_clusters
 
-                    max_active_clusters = get_max_active_clusters(
-                        k.impl.cluster_shape_mn
-                    )
-            except Exception:
-                log.debug("Could not extract max_active_clusters for precompile")
+                max_active_clusters = get_max_active_clusters(k.impl.cluster_shape_mn)
 
         return {
             "precompile_shapes": precompile_shapes,
@@ -616,6 +613,7 @@ class NVUniversalGemmScheduling(BaseScheduling):
             "device_index": device_index,
             "device_capability": device_capability,
             "max_active_clusters": max_active_clusters,
+            "epilogue_reads": epilogue_reads or [],
         }
 
     def generate_kernel_code_from_nodes(
