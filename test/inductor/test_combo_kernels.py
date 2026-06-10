@@ -843,7 +843,13 @@ class ComboKernelTests(TestCase):
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
         out_compiled, code = run_and_get_code(torch.compile(fn), *inps)
-        self.assertEqual(out_eager, out_compiled)
+        # XPU persistent reduction uses tl.atomic_add(sem='relaxed') which can
+        # produce slightly different float32 results due to different atomic
+        # ordering on Intel GPU hardware. Relax tolerances accordingly.
+        if GPU_TYPE == "xpu":
+            self.assertEqual(out_eager, out_compiled, atol=2e-5, rtol=1.5e-5)
+        else:
+            self.assertEqual(out_eager, out_compiled)
         combined = " ".join(code)
         self.assertEqual(combined.count("async_compile.triton("), 1)
 
