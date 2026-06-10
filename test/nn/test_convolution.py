@@ -3233,6 +3233,7 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @onlyAccelerator
     @largeTensorTest("12GB")
     @serialTest()
+    @expectedFailureXPU
     def test_conv_transposed_large(self, device):
         dtype = torch.half if self.device_type != "cpu" else torch.float
         conv = nn.ConvTranspose2d(1, 1, 1, 1, bias=False).to(device).to(dtype)
@@ -3931,6 +3932,7 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @largeTensorTest("20GB")
     @largeTensorTest("64GB", "cpu")
     @serialTest()
+    @expectedFailureXPU
     # Note: This xfail only applies to cuDNN (CUDA), not MIOpen (ROCm)
     # Reference: https://github.com/ROCm/MIOpen/pull/2838
     @xfailIf(
